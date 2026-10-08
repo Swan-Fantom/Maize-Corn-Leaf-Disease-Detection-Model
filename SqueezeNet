@@ -1,0 +1,1217 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torchvision import datasets, transforms
+from torchvision.models import squeezenet1_1, SqueezeNet1_1_Weights
+
+from torch.utils.data import DataLoader
+
+import time
+import copy
+import math
+import cv2
+import numpy as np
+
+from PIL import Image
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_curve,
+    auc
+)
+
+from sklearn.preprocessing import label_binarize
+
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+epochs = 100
+batch_size = 32
+
+num_classes = 4
+
+learning_rate = 0.000375
+weight_decay = 0.05
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("Device:", device)
+
+
+# ============================================================
+# LEAF SEGMENTATION
+# ============================================================
+
+def segment_leaf(img):
+
+    # PIL -> NumPy
+    img_np = np.array(img)
+
+    # RGB -> HSV
+    hsv = cv2.cvtColor(
+        img_np,
+        cv2.COLOR_RGB2HSV
+    )
+
+    # Green range
+    lower = np.array([25, 40, 40])
+    upper = np.array([95, 255, 255])
+
+    mask = cv2.inRange(
+        hsv,
+        lower,
+        upper
+    )
+
+    # Morphological closing
+    kernel = np.ones(
+        (5, 5),
+        np.uint8
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    # If no leaf detected
+    if np.count_nonzero(mask) == 0:
+        return Image.fromarray(img_np)
+
+    # Keep leaf
+    result = cv2.bitwise_and(
+        img_np,
+        img_np,
+        mask=mask
+    )
+
+    # Bounding box
+    ys, xs = np.where(mask > 0)
+
+    x_min, x_max = xs.min(), xs.max()
+    y_min, y_max = ys.min(), ys.max()
+
+    # Crop
+    cropped = result[
+        y_min:y_max + 1,
+        x_min:x_max + 1
+    ]
+
+    # Resize to original dimensions
+    resized = cv2.resize(
+        cropped,
+        (img_np.shape[1], img_np.shape[0])
+    )
+
+    return Image.fromarray(resized)
+
+
+# ============================================================
+# TRANSFORMS
+# ============================================================
+
+train_transforms = transforms.Compose([
+
+    transforms.Lambda(
+        lambda img: segment_leaf(img)
+    ),
+
+    transforms.RandomRotation(
+        degrees=20
+    ),
+
+    transforms.RandomHorizontalFlip(),
+
+    transforms.Resize(
+        (224, 224)
+    ),
+
+    transforms.ToTensor(),
+
+    # ImageNet normalization
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
+])
+
+
+val_transforms = transforms.Compose([
+
+    transforms.Lambda(
+        lambda img: segment_leaf(img)
+    ),
+
+    transforms.Resize(
+        (224, 224)
+    ),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
+])
+
+
+# ============================================================
+# DATASETS
+# ============================================================
+
+train_dataset = datasets.ImageFolder(
+    '/kaggle/input/plant-village-corn1/PlantVillage/train',
+    transform=train_transforms
+)
+
+val_dataset = datasets.ImageFolder(
+    '/kaggle/input/plant-village-corn1/PlantVillage/val',
+    transform=val_transforms
+)
+
+
+print("Classes:")
+print(train_dataset.classes)
+
+print(
+    "Training images:",
+    len(train_dataset)
+)
+
+print(
+    "Validation images:",
+    len(val_dataset)
+)
+
+
+# ============================================================
+# DATA LOADERS
+# ============================================================
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+# Load ImageNet pretrained SqueezeNet 1.1
+weights = SqueezeNet1_1_Weights.DEFAULT
+
+model = squeezenet1_1(
+    weights=weights
+)
+
+
+# ============================================================
+# MODIFY CLASSIFIER
+# ============================================================
+
+# Original SqueezeNet classifier:
+#
+# Dropout
+# Conv2d(512 -> 1000)
+#
+# We change 1000 ImageNet classes
+# to our 4 maize disease classes.
+
+model.classifier[1] = nn.Conv2d(
+    512,
+    num_classes,
+    kernel_size=1
+)
+
+
+# Move model to GPU/CPU
+model = model.to(device)
+
+
+print("\nSqueezeNet 1.1 created successfully.")
+print("Using ImageNet pretrained weights.")
+print("Number of classes:", num_classes)
+
+
+# ============================================================
+# LOSS
+# ============================================================
+
+train_criterion = nn.CrossEntropyLoss(
+    label_smoothing=0.1
+)
+
+val_criterion = nn.CrossEntropyLoss()
+
+
+# ============================================================
+# OPTIMIZER
+# ============================================================
+
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=learning_rate,
+    weight_decay=weight_decay
+)
+
+
+# ============================================================
+# COSINE LR WITH WARMUP
+# ============================================================
+
+def get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_epochs,
+    num_training_epochs
+):
+
+    def lr_lambda(current_epoch):
+
+        if current_epoch < num_warmup_epochs:
+
+            return (
+                float(current_epoch + 1)
+                /
+                float(
+                    max(
+                        1,
+                        num_warmup_epochs
+                    )
+                )
+            )
+
+        return 0.5 * (
+            1.0
+            +
+            math.cos(
+                math.pi
+                *
+                (
+                    current_epoch
+                    -
+                    num_warmup_epochs
+                )
+                /
+                (
+                    num_training_epochs
+                    -
+                    num_warmup_epochs
+                )
+            )
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda
+    )
+
+
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_epochs=5,
+    num_training_epochs=epochs
+)
+
+
+# ============================================================
+# TRAIN ONE EPOCH
+# ============================================================
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion
+):
+
+    model.train()
+
+    running_loss = 0.0
+    running_corrects = 0
+
+    for inputs, labels in loader:
+
+        inputs = inputs.to(
+            device,
+            non_blocking=True
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True
+        )
+
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+
+        loss = criterion(
+            outputs,
+            labels
+        )
+
+        loss.backward()
+
+        optimizer.step()
+
+        # Predictions
+        _, preds = torch.max(
+            outputs,
+            1
+        )
+
+        running_loss += (
+            loss.item()
+            *
+            inputs.size(0)
+        )
+
+        running_corrects += (
+            preds == labels
+        ).sum().item()
+
+
+    epoch_loss = (
+        running_loss
+        /
+        len(loader.dataset)
+    )
+
+    epoch_acc = (
+        running_corrects
+        /
+        len(loader.dataset)
+    )
+
+    return (
+        epoch_loss,
+        epoch_acc
+    )
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate(
+    model,
+    loader,
+    criterion
+):
+
+    model.eval()
+
+    running_loss = 0.0
+    running_corrects = 0
+
+    all_labels = []
+    all_probs = []
+
+
+    with torch.no_grad():
+
+        for inputs, labels in loader:
+
+            inputs = inputs.to(
+                device,
+                non_blocking=True
+            )
+
+            labels = labels.to(
+                device,
+                non_blocking=True
+            )
+
+            outputs = model(inputs)
+
+            loss = criterion(
+                outputs,
+                labels
+            )
+
+
+            # Probabilities
+            probs = torch.softmax(
+                outputs,
+                dim=1
+            )
+
+            all_probs.append(
+                probs.cpu().numpy()
+            )
+
+            all_labels.append(
+                labels.cpu().numpy()
+            )
+
+
+            # Predictions
+            _, preds = torch.max(
+                outputs,
+                1
+            )
+
+            running_loss += (
+                loss.item()
+                *
+                inputs.size(0)
+            )
+
+            running_corrects += (
+                preds == labels
+            ).sum().item()
+
+
+    epoch_loss = (
+        running_loss
+        /
+        len(loader.dataset)
+    )
+
+    epoch_acc = (
+        running_corrects
+        /
+        len(loader.dataset)
+    )
+
+
+    all_labels = np.concatenate(
+        all_labels
+    )
+
+    all_probs = np.concatenate(
+        all_probs
+    )
+
+
+    return (
+        epoch_loss,
+        epoch_acc,
+        all_labels,
+        all_probs
+    )
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+print("\n====================================")
+print("Starting SqueezeNet Training")
+print("====================================\n")
+
+
+train_losses = []
+val_losses = []
+
+train_accuracies = []
+val_accuracies = []
+
+
+best_val_acc = 0.0
+
+best_model_wts = copy.deepcopy(
+    model.state_dict()
+)
+
+
+for epoch in range(epochs):
+
+    start = time.time()
+
+
+    # --------------------------------------------------------
+    # TRAIN
+    # --------------------------------------------------------
+
+    train_loss, train_acc = train_one_epoch(
+        model,
+        train_loader,
+        optimizer,
+        train_criterion
+    )
+
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    val_loss, val_acc, _, _ = validate(
+        model,
+        val_loader,
+        val_criterion
+    )
+
+
+    # --------------------------------------------------------
+    # Scheduler
+    # --------------------------------------------------------
+
+    scheduler.step()
+
+
+    # --------------------------------------------------------
+    # Store metrics
+    # --------------------------------------------------------
+
+    train_losses.append(
+        train_loss
+    )
+
+    val_losses.append(
+        val_loss
+    )
+
+    train_accuracies.append(
+        train_acc
+    )
+
+    val_accuracies.append(
+        val_acc
+    )
+
+
+    # --------------------------------------------------------
+    # Save best model
+    # --------------------------------------------------------
+
+    if val_acc > best_val_acc:
+
+        best_val_acc = val_acc
+
+        best_model_wts = copy.deepcopy(
+            model.state_dict()
+        )
+
+        torch.save(
+            model.state_dict(),
+            "SqueezeNet_best.pth"
+        )
+
+
+    # --------------------------------------------------------
+    # Print
+    # --------------------------------------------------------
+
+    current_lr = optimizer.param_groups[0]["lr"]
+
+    print(
+        f"Epoch {epoch + 1}/{epochs}"
+    )
+
+    print(
+        f"Train Loss: {train_loss:.4f}"
+    )
+
+    print(
+        f"Train Acc : {train_acc:.4f}"
+    )
+
+    print(
+        f"Val Loss  : {val_loss:.4f}"
+    )
+
+    print(
+        f"Val Acc   : {val_acc:.4f}"
+    )
+
+    print(
+        f"LR        : {current_lr:.8f}"
+    )
+
+    print(
+        f"Time      : "
+        f"{time.time() - start:.2f}s"
+    )
+
+    print()
+
+
+# ============================================================
+# LOAD BEST MODEL
+# ============================================================
+
+model.load_state_dict(
+    best_model_wts
+)
+
+
+print("====================================")
+print("Training Finished")
+print("====================================")
+
+print(
+    f"Best Validation Accuracy: "
+    f"{best_val_acc:.4f}"
+)
+
+
+# ============================================================
+# FINAL VALIDATION
+# ============================================================
+
+final_val_loss, final_val_acc, y_true, y_prob = validate(
+    model,
+    val_loader,
+    val_criterion
+)
+
+
+print(
+    f"\nFinal Validation Accuracy: "
+    f"{final_val_acc:.4f}"
+)
+
+
+# ============================================================
+# FINAL METRICS
+# ============================================================
+
+def evaluate_metrics(
+    model,
+    dataloader,
+    criterion,
+    device
+):
+
+    model.eval()
+
+    running_loss = 0.0
+
+    all_preds = []
+    all_labels = []
+
+
+    with torch.no_grad():
+
+        for inputs, labels in dataloader:
+
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+
+            loss = criterion(
+                outputs,
+                labels
+            )
+
+            running_loss += (
+                loss.item()
+                *
+                inputs.size(0)
+            )
+
+            _, preds = torch.max(
+                outputs,
+                1
+            )
+
+            all_preds.extend(
+                preds.cpu().numpy()
+            )
+
+            all_labels.extend(
+                labels.cpu().numpy()
+            )
+
+
+    epoch_loss = (
+        running_loss
+        /
+        len(dataloader.dataset)
+    )
+
+
+    accuracy = accuracy_score(
+        all_labels,
+        all_preds
+    )
+
+    precision = precision_score(
+        all_labels,
+        all_preds,
+        average='macro',
+        zero_division=0
+    )
+
+    recall = recall_score(
+        all_labels,
+        all_preds,
+        average='macro',
+        zero_division=0
+    )
+
+    f1 = f1_score(
+        all_labels,
+        all_preds,
+        average='macro',
+        zero_division=0
+    )
+
+
+    return (
+        epoch_loss,
+        accuracy,
+        precision,
+        recall,
+        f1
+    )
+
+
+# ============================================================
+# TRAIN METRICS
+# ============================================================
+
+train_loss, train_acc, train_prec, train_rec, train_f1 = evaluate_metrics(
+    model,
+    train_loader,
+    train_criterion,
+    device
+)
+
+
+print("\n==============================")
+print("FINAL TRAINING METRICS")
+print("==============================")
+
+print(
+    f"Train Loss: {train_loss:.4f}"
+)
+
+print(
+    f"Train Accuracy: "
+    f"{train_acc * 100:.2f}%"
+)
+
+print(
+    f"Train Precision: "
+    f"{train_prec:.4f}"
+)
+
+print(
+    f"Train Recall: "
+    f"{train_rec:.4f}"
+)
+
+print(
+    f"Train F1: "
+    f"{train_f1:.4f}"
+)
+
+
+# ============================================================
+# VALIDATION METRICS
+# ============================================================
+
+val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate_metrics(
+    model,
+    val_loader,
+    val_criterion,
+    device
+)
+
+
+print("\n==============================")
+print("FINAL VALIDATION METRICS")
+print("==============================")
+
+print(
+    f"Val Loss: {val_loss:.4f}"
+)
+
+print(
+    f"Val Accuracy: "
+    f"{val_acc * 100:.2f}%"
+)
+
+print(
+    f"Val Precision: "
+    f"{val_prec:.4f}"
+)
+
+print(
+    f"Val Recall: "
+    f"{val_rec:.4f}"
+)
+
+print(
+    f"Val F1: "
+    f"{val_f1:.4f}"
+)
+
+
+# ============================================================
+# ACCURACY CURVE
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    train_accuracies,
+    label="Train Accuracy"
+)
+
+plt.plot(
+    val_accuracies,
+    label="Validation Accuracy"
+)
+
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+
+plt.title(
+    "SqueezeNet Accuracy"
+)
+
+plt.legend()
+
+plt.grid()
+
+plt.show()
+
+
+# ============================================================
+# LOSS CURVE
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    train_losses,
+    label="Train Loss"
+)
+
+plt.plot(
+    val_losses,
+    label="Validation Loss"
+)
+
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+
+plt.title(
+    "SqueezeNet Loss"
+)
+
+plt.legend()
+
+plt.grid()
+
+plt.show()
+
+
+# ============================================================
+# ROC CURVES
+# ============================================================
+
+classes = train_dataset.classes
+
+y_true_bin = label_binarize(
+    y_true,
+    classes=list(range(num_classes))
+)
+
+
+plt.figure(figsize=(10, 8))
+
+
+# Class-wise ROC
+for i in range(num_classes):
+
+    fpr, tpr, _ = roc_curve(
+        y_true_bin[:, i],
+        y_prob[:, i]
+    )
+
+    roc_auc = auc(
+        fpr,
+        tpr
+    )
+
+    plt.plot(
+        fpr,
+        tpr,
+        label=(
+            f"{classes[i]} "
+            f"(AUC = {roc_auc:.2f})"
+        )
+    )
+
+
+# Micro-average
+fpr, tpr, _ = roc_curve(
+    y_true_bin.ravel(),
+    y_prob.ravel()
+)
+
+roc_auc = auc(
+    fpr,
+    tpr
+)
+
+plt.plot(
+    fpr,
+    tpr,
+    linestyle='--',
+    color='black',
+    label=(
+        f"Micro-average "
+        f"(AUC = {roc_auc:.2f})"
+    )
+)
+
+
+# Random classifier
+plt.plot(
+    [0, 1],
+    [0, 1],
+    'k--'
+)
+
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+plt.title(
+    "ROC Curves - SqueezeNet"
+)
+
+plt.legend(
+    loc="lower right"
+)
+
+plt.grid()
+
+plt.show()
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct_preds = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, preds = torch.max(outputs, 1)
+            correct_preds += torch.sum(preds == labels.data)
+            total_samples += labels.size(0)
+
+    epoch_loss = running_loss / total_samples
+    epoch_acc = correct_preds.double() / total_samples
+
+    return epoch_loss, epoch_acc.item()
+
+# After training
+
+final_train_loss, final_train_acc = evaluate(model, train_loader, train_criterion, device)
+print(f"Final Training Loss: {final_train_loss:.4f}, Final Training Accuracy: {final_train_acc * 100:.2f}%")
+
+final_val_loss, final_val_acc = evaluate(model, val_loader, val_criterion, device)
+print(f"\nFinal Validation Loss: {final_val_loss:.4f}, Final Validation Accuracy: {final_val_acc * 100:.2f}%")
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+    recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+    return epoch_loss, accuracy, precision, recall, f1
+
+
+train_loss, train_acc, train_prec, train_rec, train_f1 = evaluate(model, train_loader, train_criterion, device)
+print(f"Train Loss: {train_loss:.4f}")
+print(f"Train Acc: {train_acc*100:.2f}%, Precision: {train_prec:.4f}, Recall: {train_rec:.4f}, F1: {train_f1:.4f}")
+
+val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(model, val_loader, val_criterion, device)
+print(f"\nVal Loss: {val_loss:.4f}")
+print(f"Val Acc: {val_acc*100:.2f}%, Precision: {val_prec:.4f}, Recall: {val_rec:.4f}, F1: {val_f1:.4f}")
+
+# === ROC CURVES ===
+classes = list(train_dataset.class_to_idx.keys())
+y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+
+plt.figure(figsize=(10, 8))
+
+for i in range(num_classes):
+    fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"{classes[i]} (AUC = {roc_auc:.2f})")
+
+# Micro-average
+fpr, tpr, _ = roc_curve(y_true_bin.ravel(), y_prob.ravel())
+roc_auc = auc(fpr, tpr)
+plt.plot(fpr, tpr, linestyle='--', color='black', label=f"Micro-average (AUC = {roc_auc:.2f})")
+
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curves - Corn Leaf Disease Classification")
+plt.legend(loc="lower right")
+plt.show() 
+
+import matplotlib.pyplot as plt
+
+epochs_range = range(1, epochs + 1)
+
+plt.figure(figsize=(14, 5))
+
+# === ACCURACY CURVE ===
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, train_accuracies, label='Train Accuracy')
+plt.plot(epochs_range, val_accuracies, label='Validation Accuracy')
+plt.title('Accuracy Over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.ylim(0, 1.05)
+plt.grid(True)
+plt.legend()
+
+# === LOSS CURVE ===
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, train_losses, label='Train Loss')
+plt.plot(epochs_range, val_losses, label='Validation Loss')
+plt.title('Loss Over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, precision_score, recall_score, f1_score
+
+def evaluate_and_plot(model, dataloader, criterion, device, class_names):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    # === METRICS ===
+    epoch_loss = running_loss / len(dataloader.dataset)
+    acc = accuracy_score(all_labels, all_preds)
+    prec = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+    rec = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+    print(f"Loss: {epoch_loss:.4f} | Acc: {acc*100:.2f}% | Prec: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
+
+    # === CONFUSION MATRIX ===
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.show()
+
+    # === PER-CLASS METRICS ===
+    class_report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True, zero_division=0)
+    precision_vals = [class_report[cls]['precision'] for cls in class_names]
+    recall_vals = [class_report[cls]['recall'] for cls in class_names]
+    f1_vals = [class_report[cls]['f1-score'] for cls in class_names]
+
+    x = range(len(class_names))
+    width = 0.2
+
+    plt.figure(figsize=(10, 5))
+    plt.bar([i - width for i in x], precision_vals, width=width, label='Precision')
+    plt.bar(x, recall_vals, width=width, label='Recall')
+    plt.bar([i + width for i in x], f1_vals, width=width, label='F1-score')
+    plt.xticks(x, class_names)
+    plt.ylim(0, 1.05)
+    plt.ylabel("Score")
+    plt.title("Per-Class Metrics")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return epoch_loss, acc, prec, rec, f1
+
+# Example usage (assuming 4 classes)
+class_names = ['Healthy', 'Gray Leaf Spot', 'Common Rust', 'Northern Leaf Blight']
+
+print("== Final Train Set Evaluation ==")
+evaluate_and_plot(model, train_loader, train_criterion, device, class_names)
+
+print("\n== Final Validation Set Evaluation ==")
+evaluate_and_plot(model, val_loader, val_criterion, device, class_names)
+
+
+
