@@ -1,0 +1,186 @@
+LeViT Code:-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+import time
+import copy
+import os
+import timm
+import torch.nn as nn
+import cv2
+import numpy as np
+from PIL import Image
+from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import label_binarize
+import matplotlib.pyplot as plt
+
+
+
+# === CONFIG ===
+epochs=100
+batch_size = 32
+num_classes = 4
+learning_rate = 0.000375  # as recommended for LeViT fine-tuning
+weight_decay = 0.05     # standard for LeViT training
+
+# === DATA AUGMENTATION, SEGMENTATION & LOADERS ===
+
+from PIL import Image
+import numpy as np
+import cv2
+
+def segment_leaf(img):
+    # Convert PIL Image to NumPy array
+    img_np = np.array(img)
+
+    # Convert RGB to HSV
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+
+    # Define HSV range for green
+    lower = np.array([25, 40, 40])
+    upper = np.array([95, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+
+    # Morphological closing to fill small gaps
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Check if any leaf pixels are detected
+    if np.count_nonzero(mask) == 0:
+        return Image.fromarray(img_np)  # Return original image if mask is empty
+
+    # Apply mask to keep only the leaf
+    result = cv2.bitwise_and(img_np, img_np, mask=mask)
+
+    # Find bounding box of the leaf
+    ys, xs = np.where(mask > 0)
+    x_min, x_max = xs.min(), xs.max()
+    y_min, y_max = ys.min(), ys.max()
+
+    # Crop to the bounding box
+    cropped = result[y_min:y_max, x_min:x_max]
+
+    # Resize cropped region back to original size
+    resized = cv2.resize(cropped, (img_np.shape[1], img_np.shape[0]))
+
+    return Image.fromarray(resized)
+
+train_transforms = transforms.Compose([
+    transforms.Lambda(lambda img: segment_leaf(img)),
+    transforms.RandomRotation(degrees=20),
+    transforms.RandomHorizontalFlip(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+val_transforms = transforms.Compose([
+    transforms.Lambda(lambda img: segment_leaf(img)),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+train_dataset = datasets.ImageFolder('/kaggle/input/plant-village-corn1/PlantVillage/train', transform=train_transforms)
+val_dataset = datasets.ImageFolder('/kaggle/input/plant-village-corn1/PlantVillage/val', transform=val_transforms)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+# === MODEL ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load pretrained LeViT-192 from timm
+model = timm.create_model('levit_256', pretrained=True, num_classes=num_classes)
+model=model.to(device)
+train_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+val_criterion = nn.CrossEntropyLoss()  # no label smoothing
+optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+# === COSINE LR SCHEDULER ===
+# Optionally warm up LR for a few epochs before cosine decay
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_epochs, num_training_epochs):
+    def lr_lambda(current_epoch):
+        if current_epoch < num_warmup_epochs:
+            return float(current_epoch) / float(max(1, num_warmup_epochs))
+        return 0.5 * (1. + math.cos(math.pi * (current_epoch - num_warmup_epochs) / (num_training_epochs - num_warmup_epochs)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+import math
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_epochs=5, num_training_epochs=epochs)
+
+# === TRAINING FUNCTIONS ===
+def train_one_epoch(model, loader, optimizer, criterion):
+    model.train()
+    running_loss, running_corrects = 0.0, 0
+    for inputs, labels in loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        _, preds = torch.max(outputs, 1)
+        running_loss += loss.item() * inputs.size(0)
+        running_corrects += torch.sum(preds == labels.data)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = running_corrects.double() / len(loader.dataset)
+    return epoch_loss, epoch_acc.item()
+
+def validate(model, loader, criterion,num_classes):
+    model.eval()
+    running_loss, running_corrects = 0.0, 0
+    all_labels, all_probs = [], []
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            probs = torch.softmax(outputs, dim=1)  # probabilities
+            all_probs.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            
+            _, preds = torch.max(outputs, 1)
+            running_loss += loss.item() * inputs.size(0)
+            running_corrects += torch.sum(preds == labels.data)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = running_corrects.double() / len(loader.dataset)
+    
+    all_labels = np.concatenate(all_labels)
+    all_probs = np.concatenate(all_probs)
+    
+    return epoch_loss, epoch_acc.item(), all_labels, all_probs
+
+# === TRAINING LOOP ===
+
+print("Starting Training......\n")
+train_losses, val_losses = [], []
+train_accuracies, val_accuracies = [], []
+
+for epoch in range(epochs):
+    start = time.time()
+    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, train_criterion)
+    if epoch == epochs - 1:  # last epoch -> collect ROC data
+        val_loss, val_acc, y_true, y_prob = validate(model, val_loader, val_criterion, num_classes)
+    else:
+        val_loss, val_acc, _, _ = validate(model, val_loader, val_criterion, num_classes)
+
+    scheduler.step()
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    train_accuracies.append(train_acc)
+    val_accuracies.append(val_acc)
+
+    print(f"Epoch {epoch+1}/{epochs}")
+    print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+    print(f"\u23f1 Time taken: {time.time() - start:.2f} seconds\n")
+
+print("Training Ended")
